@@ -229,6 +229,39 @@ function useStoredDoses(key) {
   return [doses, setDoses];
 }
 
+function useStoredMeals(key) {
+  const [meals, setMeals] = useState([]);
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    try {
+      if (typeof window === "undefined") return;
+      const raw = window.localStorage.getItem(key);
+      if (raw != null) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          setMeals(parsed.map((m) => ({ ...m, mealTime: new Date(m.mealTime) })));
+        }
+      }
+    } catch {}
+    setHydrated(true);
+  }, [key]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      if (typeof window === "undefined") return;
+      const serialized = meals.map((m) => ({
+        ...m,
+        mealTime: m.mealTime instanceof Date ? m.mealTime.toISOString() : m.mealTime,
+      }));
+      window.localStorage.setItem(key, JSON.stringify(serialized));
+    } catch {}
+  }, [key, meals, hydrated]);
+
+  return [meals, setMeals];
+}
+
 /* ────────────────────────────────────────────────────────────────
    Small UI atoms
    ────────────────────────────────────────────────────────────── */
@@ -312,6 +345,7 @@ export default function InsulinOverlapApp() {
   const [meal,           setMeal]           = useStoredState("insulin.meal",        []);
   const [mealProfile,    setMealProfile]    = useStoredState("insulin.mealProfile", "normal");
   const [recentFoodIds,  setRecentFoodIds]  = useStoredState("insulin.recentFoods", []);
+  const [loggedMeals,    setLoggedMeals]    = useStoredMeals("insulin.loggedMeals");
 
   // Local UI state
   const [currentBG,       setCurrentBG]       = useState("");
@@ -344,6 +378,14 @@ export default function InsulinOverlapApp() {
   );
 
   const preBolusMin = preBolusFor(currentBG);
+
+  const activeLoggedMeals = useMemo(() => {
+    return loggedMeals.filter((m) => {
+      const elapsed = (now.getTime() - new Date(m.mealTime).getTime()) / 60000;
+      const duration = (CARB_PROFILES[m.profile] || CARB_PROFILES.normal).duration;
+      return elapsed < duration;
+    });
+  }, [loggedMeals, now]);
 
   const calc = useMemo(() => {
     const icrNum = parseFloat(icr) || 15;
@@ -381,29 +423,77 @@ export default function InsulinOverlapApp() {
     return { carbInsulin, correction, grossDose, netDose, strategy, planned };
   }, [icr, cf, target, currentBG, totalCarbs, iob, mealProfile, preBolusMin, now]);
 
+  /* ── Primary meal source for the chart ─────────────────────
+     Planning mode: an active plate is being built. Chart projects forward.
+     Logged mode:   plate was logged; latest snapshot drives the chart until
+                    its carb absorption window expires. */
+
+  const primaryMeal = useMemo(() => {
+    const targetNum = parseFloat(target) || 110;
+    if (meal.length > 0) {
+      return {
+        mode: "planning",
+        carbs: totalCarbs,
+        profile: mealProfile,
+        mealTime: addMinutes(now, preBolusMin),
+        baseBG: !isNaN(parseFloat(currentBG)) ? parseFloat(currentBG) : targetNum,
+      };
+    }
+    if (activeLoggedMeals.length > 0) {
+      const latest = [...activeLoggedMeals].sort(
+        (a, b) => new Date(b.mealTime).getTime() - new Date(a.mealTime).getTime()
+      )[0];
+      return {
+        mode: "logged",
+        carbs: latest.carbs,
+        profile: latest.profile,
+        mealTime: new Date(latest.mealTime),
+        baseBG: latest.bgAtMeal,
+      };
+    }
+    if (calc.planned.some((p) => p.units > 0)) {
+      return {
+        mode: "planning",
+        carbs: 0,
+        profile: mealProfile,
+        mealTime: addMinutes(now, preBolusMin),
+        baseBG: !isNaN(parseFloat(currentBG)) ? parseFloat(currentBG) : targetNum,
+      };
+    }
+    return null;
+  }, [meal, totalCarbs, mealProfile, now, preBolusMin, currentBG, target, activeLoggedMeals, calc.planned]);
+
   /* ── Overlap chart (carbs vs insulin, mg/dL/min) ──────────── */
 
   const overlapData = useMemo(() => {
-    if (totalCarbs === 0 && calc.planned.every((p) => p.units === 0)) return [];
+    if (!primaryMeal) return [];
     const data = [];
-    const carbArea = carbCurveArea(mealProfile) || 1;
+    const carbArea = carbCurveArea(primaryMeal.profile) || 1;
     const cfNum = parseFloat(cf) || 45;
     const diaNum = parseFloat(dia) || 4;
-    const targetNum = parseFloat(target) || 110;
-    const bgIn = parseFloat(currentBG);
-    const baseBG = !isNaN(bgIn) ? bgIn : targetNum;
+    const baseBG = primaryMeal.baseBG;
+    const mealTimeMs = primaryMeal.mealTime.getTime();
     let cumulative = 0;
     let prevNet = null;
     const dt = 2;
     for (let t = -10; t <= 240; t += dt) {
-      const carbR = totalCarbs > 0 ? (totalCarbs * 4 * carbRate(t, mealProfile)) / carbArea : 0;
+      const carbR = primaryMeal.carbs > 0
+        ? (primaryMeal.carbs * 4 * carbRate(t, primaryMeal.profile)) / carbArea
+        : 0;
       let insR = 0;
-      for (const p of calc.planned) {
-        if (p.units <= 0) continue;
-        const elapsedFromDose = t - p.delayMin;
-        const rateUnitsPerHr = p.units * insulinActivityRate(elapsedFromDose, diaNum);
-        const rateUnitsPerMin = rateUnitsPerHr / 60;
-        insR += rateUnitsPerMin * cfNum;
+      for (const d of doses) {
+        const tDose = (new Date(d.time).getTime() - mealTimeMs) / 60000;
+        const elapsedFromDose = t - tDose;
+        const rateUnitsPerHr = d.units * insulinActivityRate(elapsedFromDose, diaNum);
+        insR += (rateUnitsPerHr / 60) * cfNum;
+      }
+      if (primaryMeal.mode === "planning") {
+        for (const p of calc.planned) {
+          if (p.units <= 0) continue;
+          const elapsedFromDose = t - p.delayMin;
+          const rateUnitsPerHr = p.units * insulinActivityRate(elapsedFromDose, diaNum);
+          insR += (rateUnitsPerHr / 60) * cfNum;
+        }
       }
       const net = carbR - insR;
       if (prevNet !== null) cumulative += ((prevNet + net) / 2) * dt;
@@ -416,7 +506,7 @@ export default function InsulinOverlapApp() {
       });
     }
     return data;
-  }, [totalCarbs, mealProfile, calc.planned, cf, dia, currentBG, target]);
+  }, [primaryMeal, doses, calc.planned, cf, dia]);
 
   const { carbPeak, insPeak, peakDiagnosis } = useMemo(() => {
     let cp = { t: 0, v: 0 };
@@ -583,7 +673,19 @@ export default function InsulinOverlapApp() {
         time: addMinutes(baseTime, p.offset),
         label: p.label.toLowerCase(),
       }));
+    const targetNum = parseFloat(target) || 110;
+    const bgAtMeal = !isNaN(parseFloat(currentBG)) ? parseFloat(currentBG) : targetNum;
     setDoses((d) => [...d, ...newDoses]);
+    if (totalCarbs > 0) {
+      const newLoggedMeal = {
+        id: Date.now() + Math.random(),
+        carbs: totalCarbs,
+        profile: mealProfile,
+        mealTime: addMinutes(baseTime, preBolusMin),
+        bgAtMeal,
+      };
+      setLoggedMeals((m) => [...m, newLoggedMeal]);
+    }
     setMeal([]);
     setCurrentBG("");
     vibrate(12);
@@ -1230,7 +1332,9 @@ export default function InsulinOverlapApp() {
             <div className="label-eyebrow ink-3 mb-2 flex items-center justify-between">
               <span>Predicted BG</span>
               <span className="ink-3 num text-[10px] normal-case tracking-normal">
-                {!isNaN(parseFloat(currentBG)) ? "from your BG" : `from target ${parseFloat(target) || 110}`}
+                {primaryMeal?.mode === "logged"
+                  ? `+${Math.max(0, Math.round((now.getTime() - primaryMeal.mealTime.getTime()) / 60000))}m since meal`
+                  : !isNaN(parseFloat(currentBG)) ? "from your BG" : `from target ${parseFloat(target) || 110}`}
               </span>
             </div>
             {bgStats && (
@@ -1329,7 +1433,9 @@ export default function InsulinOverlapApp() {
                 </ResponsiveContainer>
               </div>
               <div className="ink-3 text-[10px] mt-2 italic leading-relaxed">
-                Modeled trace from {!isNaN(parseFloat(currentBG)) ? "current BG" : "target"} given the plan above. Compare to your Libre 3 trace — if reality diverges, adjust ICR or pre-bolus.
+                {primaryMeal?.mode === "logged"
+                  ? "Modeled trace from your logged dose & meal. Compare to your Libre 3 trace — if reality diverges, adjust ICR or pre-bolus."
+                  : `Modeled trace from ${!isNaN(parseFloat(currentBG)) ? "current BG" : "target"} given the plan above. Compare to your Libre 3 trace — if reality diverges, adjust ICR or pre-bolus.`}
               </div>
             </div>
           </section>
