@@ -389,7 +389,13 @@ export default function InsulinOverlapApp() {
     const carbArea = carbCurveArea(mealProfile) || 1;
     const cfNum = parseFloat(cf) || 45;
     const diaNum = parseFloat(dia) || 4;
-    for (let t = -10; t <= 240; t += 2) {
+    const targetNum = parseFloat(target) || 110;
+    const bgIn = parseFloat(currentBG);
+    const baseBG = !isNaN(bgIn) ? bgIn : targetNum;
+    let cumulative = 0;
+    let prevNet = null;
+    const dt = 2;
+    for (let t = -10; t <= 240; t += dt) {
       const carbR = totalCarbs > 0 ? (totalCarbs * 4 * carbRate(t, mealProfile)) / carbArea : 0;
       let insR = 0;
       for (const p of calc.planned) {
@@ -399,10 +405,18 @@ export default function InsulinOverlapApp() {
         const rateUnitsPerMin = rateUnitsPerHr / 60;
         insR += rateUnitsPerMin * cfNum;
       }
-      data.push({ t, carb: round2(carbR), insulin: round2(insR) });
+      const net = carbR - insR;
+      if (prevNet !== null) cumulative += ((prevNet + net) / 2) * dt;
+      prevNet = net;
+      data.push({
+        t,
+        carb: round2(carbR),
+        insulin: round2(insR),
+        bg: round2(baseBG + cumulative),
+      });
     }
     return data;
-  }, [totalCarbs, mealProfile, calc.planned, cf, dia]);
+  }, [totalCarbs, mealProfile, calc.planned, cf, dia, currentBG, target]);
 
   const { carbPeak, insPeak, peakDiagnosis } = useMemo(() => {
     let cp = { t: 0, v: 0 };
@@ -429,6 +443,26 @@ export default function InsulinOverlapApp() {
     }
     return { carbPeak: cp, insPeak: ip, peakDiagnosis: diag };
   }, [overlapData]);
+
+  /* ── Predicted BG stats ───────────────────────────────────── */
+
+  const bgStats = useMemo(() => {
+    if (overlapData.length === 0) return null;
+    let bgMin = { t: 0, v: Infinity };
+    let bgMax = { t: 0, v: -Infinity };
+    let landing = overlapData[overlapData.length - 1].bg;
+    for (const d of overlapData) {
+      if (d.bg < bgMin.v) bgMin = { t: d.t, v: d.bg };
+      if (d.bg > bgMax.v) bgMax = { t: d.t, v: d.bg };
+    }
+    const targetNum = parseFloat(target) || 110;
+    let note = "";
+    if (bgMin.v < 70) note = `Predicted dip to ${Math.round(bgMin.v)} at +${bgMin.t}m — hypo risk.`;
+    else if (bgMax.v > 250) note = `Predicted spike to ${Math.round(bgMax.v)} at +${bgMax.t}m — consider longer pre-bolus.`;
+    else if (bgMax.v > 180) note = `Peak ${Math.round(bgMax.v)} at +${bgMax.t}m, landing near ${Math.round(landing)}.`;
+    else note = `Peak ${Math.round(bgMax.v)} at +${bgMax.t}m, landing near ${Math.round(landing)} (target ${targetNum}).`;
+    return { bgMin, bgMax, landing, note };
+  }, [overlapData, target]);
 
   /* ── Six-hour activity chart (units/hour) ─────────────────── */
 
@@ -1185,6 +1219,117 @@ export default function InsulinOverlapApp() {
                   <span className="inline-block w-3 h-2 rounded-sm" style={{ backgroundColor: "#6ba8c4" }} />
                   Insulin lowering BG
                 </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* 6.11b Predicted BG trace */}
+        {overlapData.length > 0 && (
+          <section className="mt-5">
+            <div className="label-eyebrow ink-3 mb-2 flex items-center justify-between">
+              <span>Predicted BG</span>
+              <span className="ink-3 num text-[10px] normal-case tracking-normal">
+                {!isNaN(parseFloat(currentBG)) ? "from your BG" : `from target ${parseFloat(target) || 110}`}
+              </span>
+            </div>
+            {bgStats && (
+              <div className="border-l-2 border-[#8fb37e] pl-3 py-1 mb-3 ink-2 text-xs italic">
+                {bgStats.note}
+              </div>
+            )}
+            <div className="bg-paper border border-hair rounded-2xl p-3">
+              <div style={{ width: "100%", height: 180 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={overlapData} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#f1e7d0" stopOpacity={0.30} />
+                        <stop offset="100%" stopColor="#f1e7d0" stopOpacity={0.02} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="2 4" stroke="#3a2f25" />
+                    <XAxis
+                      dataKey="t"
+                      type="number"
+                      domain={[-10, 240]}
+                      ticks={[0, 30, 60, 90, 120, 180, 240]}
+                      tick={{ fill: "#7a6c5d", fontSize: 10, fontFamily: "JetBrains Mono" }}
+                      tickFormatter={(v) => (v === 0 ? "meal" : `+${v}`)}
+                      stroke="#3a2f25"
+                    />
+                    <YAxis
+                      tick={{ fill: "#7a6c5d", fontSize: 10, fontFamily: "JetBrains Mono" }}
+                      stroke="#3a2f25"
+                      domain={["auto", "auto"]}
+                      label={{
+                        value: "mg/dL",
+                        position: "insideLeft",
+                        angle: -90,
+                        offset: 18,
+                        style: { fill: "#7a6c5d", fontSize: 9, fontStyle: "italic" },
+                      }}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: "#1a1410",
+                        border: "1px solid #3a2f25",
+                        borderRadius: 8,
+                        color: "#f1e7d0",
+                        fontFamily: "JetBrains Mono",
+                        fontSize: 11,
+                      }}
+                      labelFormatter={(v) => `+${v} min from meal`}
+                      formatter={(v) => [`${v} mg/dL`, "Predicted BG"]}
+                    />
+                    <ReferenceLine
+                      y={70}
+                      stroke="#f43f5e"
+                      strokeDasharray="2 3"
+                      strokeOpacity={0.5}
+                      label={{ value: "70", fill: "#f43f5e", fontSize: 9, position: "insideRight" }}
+                    />
+                    <ReferenceLine
+                      y={parseFloat(target) || 110}
+                      stroke="#8fb37e"
+                      strokeDasharray="2 3"
+                      strokeOpacity={0.5}
+                      label={{ value: `${parseFloat(target) || 110}`, fill: "#8fb37e", fontSize: 9, position: "insideRight" }}
+                    />
+                    <ReferenceLine
+                      y={180}
+                      stroke="#f59e0b"
+                      strokeDasharray="2 3"
+                      strokeOpacity={0.5}
+                      label={{ value: "180", fill: "#f59e0b", fontSize: 9, position: "insideRight" }}
+                    />
+                    <ReferenceLine
+                      x={0}
+                      stroke="#f1e7d0"
+                      strokeOpacity={0.5}
+                      label={{ value: "🍽", fill: "#f1e7d0", fontSize: 11, position: "top" }}
+                    />
+                    {bgStats && bgStats.bgMax.v > 0 && (
+                      <ReferenceLine
+                        x={bgStats.bgMax.t}
+                        stroke="#f1e7d0"
+                        strokeDasharray="3 3"
+                        strokeOpacity={0.35}
+                      />
+                    )}
+                    <Area
+                      type="monotone"
+                      dataKey="bg"
+                      stroke="#f1e7d0"
+                      strokeWidth={2}
+                      fill="url(#bgGrad)"
+                      isAnimationActive={false}
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="ink-3 text-[10px] mt-2 italic leading-relaxed">
+                Modeled trace from {!isNaN(parseFloat(currentBG)) ? "current BG" : "target"} given the plan above. Compare to your Libre 3 trace — if reality diverges, adjust ICR or pre-bolus.
               </div>
             </div>
           </section>
